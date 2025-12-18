@@ -21,7 +21,7 @@ Claude Code stores conversation logs as JSONL files in `~/.claude/projects/`, bu
 
 ## Demo
 
-https://github.com/user-attachments/assets/72feb201-0cb6-43fb-b654-d0144f661dbb
+https://github.com/user-attachments/assets/3b941705-e0cf-4e40-bbb4-18f469ee0316
 
 ## Requirements
 
