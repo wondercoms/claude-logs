@@ -1,0 +1,212 @@
+#!/bin/bash
+# Claude CLI Log Viewer
+
+CLAUDE_DIR="$HOME/.claude/projects"
+
+# Color definitions
+BLUE='\033[34m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+CYAN='\033[36m'
+RESET='\033[0m'
+
+show_help() {
+    echo "Usage: claude-logs [command]"
+    echo ""
+    echo "Commands:"
+    echo "  (none)    Interactive project/session selection and display"
+    echo "  list      List all projects"
+    echo "  latest    Show latest session"
+    echo "  tail      Real-time monitoring"
+    echo "  status    Check Claude CLI status"
+    echo "  help      Show this help"
+}
+
+select_project() {
+    ls -1 "$CLAUDE_DIR" | fzf --prompt="Project > " \
+        --preview="ls -lh $CLAUDE_DIR/{} | grep -v agent- | head -10" \
+        --preview-window=down:5 \
+        --height=50%
+}
+
+select_session() {
+    local project="$1"
+    
+    # Create session list (exclude agent-, datetime + filename + first user input)
+    ls -t "$CLAUDE_DIR/$project"/*.jsonl 2>/dev/null | grep -v "agent-" | head -20 | while read -r file; do
+        filename=$(basename "$file")
+        modified=$(stat -f "%Sm" -t "%m/%d %H:%M" "$file" 2>/dev/null)
+        # Get first user input
+        first_input=$(jq -r 'select(.type == "user" and (.message.content | type) == "string") | .message.content[0:50]' "$file" 2>/dev/null | head -1 | tr '\n' ' ')
+        if [ -n "$first_input" ]; then
+            echo "$modified | $filename | $first_input..."
+        else
+            echo "$modified | $filename | (no user input)"
+        fi
+    done | fzf --prompt="Session > " \
+        --preview='
+            file=$(echo {} | cut -d"|" -f2 | xargs)
+            dir="'"$CLAUDE_DIR/$project"'"
+            jq -r '\''
+                if .type == "user" and (.message.content | type) == "string" then
+                    "👤 " + .message.content[0:70]
+                elif .type == "assistant" then
+                    .message.content[]? | 
+                    if .type == "text" then
+                        "🤖 " + .text[0:70]
+                    elif .type == "tool_use" then
+                        "🔧 " + .name
+                    else
+                        empty
+                    end
+                else
+                    empty
+                end
+            '\'' "$dir/$file" 2>/dev/null | head -20
+        ' \
+        --preview-window=down:40% \
+        --height=70% | cut -d"|" -f2 | xargs
+}
+
+format_log() {
+    jq -r '
+        if .type == "user" and (.message.content | type) == "string" then
+            "\n\u001b[34m━━━━━━━━━━ USER ━━━━━━━━━━\u001b[0m\n" + .message.content
+        elif .type == "assistant" then
+            .message.content[]? | 
+            if .type == "text" then
+                "\n\u001b[32m━━━━━━━━━━ CLAUDE ━━━━━━━━━━\u001b[0m\n" + .text
+            elif .type == "tool_use" then
+                "\u001b[33m🔧 [Tool: " + .name + "]\u001b[0m"
+            else
+                empty
+            end
+        else
+            empty
+        end
+    ' 2>/dev/null
+}
+
+format_log_realtime() {
+    jq --unbuffered -r '
+        if .type == "user" and (.message.content | type) == "string" then
+            "👤 User: " + .message.content[0:100]
+        elif .type == "assistant" then
+            .message.content[]? | 
+            if .type == "text" then
+                "🤖 Claude: " + .text[0:100]
+            elif .type == "tool_use" then
+                "🔧 Tool: " + .name
+            else
+                empty
+            end
+        else
+            empty
+        end
+    '
+}
+
+cmd_list() {
+    echo -e "${CYAN}=== Claude Projects ===${RESET}"
+    echo ""
+    ls -1 "$CLAUDE_DIR" | while read -r project; do
+        # Count excluding agent-
+        count=$(ls -1 "$CLAUDE_DIR/$project"/*.jsonl 2>/dev/null | grep -v "agent-" | wc -l | tr -d ' ')
+        latest=$(ls -t "$CLAUDE_DIR/$project"/*.jsonl 2>/dev/null | grep -v "agent-" | head -1 | xargs -I {} stat -f "%Sm" -t "%Y-%m-%d %H:%M" {} 2>/dev/null)
+        echo -e "${GREEN}$project${RESET}"
+        echo "  Sessions: $count, Last: $latest"
+    done
+}
+
+cmd_latest() {
+    project=$(select_project)
+    [ -z "$project" ] && exit 0
+    
+    # Exclude agent-
+    latest=$(ls -t "$CLAUDE_DIR/$project"/*.jsonl 2>/dev/null | grep -v "agent-" | head -1)
+    if [ -z "$latest" ]; then
+        echo "No sessions found"
+        exit 1
+    fi
+    
+    echo -e "${CYAN}=== $(basename "$latest") ===${RESET}"
+    cat "$latest" | format_log | less -R
+}
+
+cmd_tail() {
+    project=$(select_project)
+    [ -z "$project" ] && exit 0
+    
+    # Exclude agent-
+    latest=$(ls -t "$CLAUDE_DIR/$project"/*.jsonl 2>/dev/null | grep -v "agent-" | head -1)
+    if [ -z "$latest" ]; then
+        echo "No sessions found"
+        exit 1
+    fi
+    
+    echo -e "${CYAN}📡 Watching: $(basename "$latest")${RESET}"
+    echo -e "${YELLOW}Press Ctrl+C to stop${RESET}"
+    echo "---"
+    
+    tail -f "$latest" | format_log_realtime
+}
+
+cmd_status() {
+    echo -e "${CYAN}=== Claude CLI Status ===${RESET}"
+    echo ""
+    
+    if ps aux | grep -v grep | grep -q "[c]laude$"; then
+        echo -e "${GREEN}✅ Running${RESET}"
+        ps aux | grep -v grep | grep "[c]laude$" | awk '{print "  PID:", $2, "| CPU:", $3"%", "| MEM:", $4"%", "| TIME:", $10}'
+    else
+        echo -e "${YELLOW}⚠️  Not detected${RESET}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}=== Recent Sessions ===${RESET}"
+    
+    # Exclude agent-
+    find "$CLAUDE_DIR" -name "*.jsonl" -type f ! -name "agent-*" -print0 2>/dev/null | \
+        xargs -0 ls -t 2>/dev/null | \
+        head -3 | \
+        while read -r file; do
+            project=$(basename $(dirname "$file"))
+            session=$(basename "$file")
+            modified=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$file" 2>/dev/null)
+            echo -e "  ${GREEN}$project${RESET}"
+            echo "    $session ($modified)"
+        done
+}
+
+cmd_interactive() {
+    project=$(select_project)
+    [ -z "$project" ] && exit 0
+    
+    session=$(select_session "$project")
+    [ -z "$session" ] && exit 0
+    
+    echo -e "${CYAN}=== $session ===${RESET}"
+    cat "$CLAUDE_DIR/$project/$session" | format_log | less -R
+}
+
+# Main
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    latest)
+        cmd_latest
+        ;;
+    tail)
+        cmd_tail
+        ;;
+    status)
+        cmd_status
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        cmd_interactive
+        ;;
+esac
